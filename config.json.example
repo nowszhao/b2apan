@@ -1,0 +1,22 @@
+{
+  "baidu": {
+    "cookie": "你的百度网盘Cookie（推荐）"
+  },
+  "aliyun": {
+    "access_token": "你的阿里云盘access_token（推荐，从 Authorization: Bearer xxx 中获取）",
+    "drive_id": "你的阿里云盘drive_id（可选，会自动获取）"
+  },
+  "sync_tasks": [
+    {
+      "baidu_folder": "/我的文件夹",
+      "aliyun_folder": "/备份/我的文件夹"
+    },
+    {
+      "baidu_folder": "/照片",
+      "aliyun_folder": "/备份/照片"
+    }
+  ],
+  "temp_dir": "/tmp/pan_sync",
+  "max_workers": 3,
+  "_comment": "阿里云盘也可以使用 refresh_token: {\"aliyun\": {\"refresh_token\": \"xxx\"}}"
+}
