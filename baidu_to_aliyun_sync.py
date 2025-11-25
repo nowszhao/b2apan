@@ -14,6 +14,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 
@@ -256,6 +258,12 @@ class AliyunPanClient:
         self.base_url = "https://api.aliyundrive.com"
         self.web_url = "https://www.aliyundrive.com"
         
+        # 创建带重试机制的 session
+        self.session = self._create_retry_session()
+        
+        # 文件夹路径缓存，避免重复查询/创建
+        self.folder_cache: Dict[str, str] = {"root": "root", "/": "root"}
+        
         # 优先级：access_token > refresh_token > cookie
         if access_token and drive_id:
             # 直接使用提供的 access_token 和 drive_id
@@ -274,6 +282,24 @@ class AliyunPanClient:
         else:
             raise ValueError("必须提供 access_token+drive_id、refresh_token 或 cookie 之一")
     
+    def _create_retry_session(self, retries=5, backoff_factor=0.5):
+        """创建带重试机制的 requests session"""
+        session = requests.Session()
+        
+        # 配置重试策略
+        retry_strategy = Retry(
+            total=retries,  # 总重试次数
+            backoff_factor=backoff_factor,  # 重试间隔指数退避因子
+            status_forcelist=[429, 500, 502, 503, 504],  # 需要重试的 HTTP 状态码
+            allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"]  # 允许重试的方法
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        
+        return session
+    
     def _verify_access_token(self):
         """验证 Access Token 是否有效"""
         try:
@@ -283,7 +309,7 @@ class AliyunPanClient:
                 "Content-Type": "application/json"
             }
             
-            response = requests.post(url, headers=headers, json={}, timeout=30)
+            response = self.session.post(url, headers=headers, json={}, timeout=30)
             
             if response.status_code == 200:
                 result = response.json()
@@ -324,7 +350,7 @@ class AliyunPanClient:
                 "Content-Type": "application/json"
             }
             
-            response = requests.post(url, headers=headers, json={}, timeout=30)
+            response = self.session.post(url, headers=headers, json={}, timeout=30)
             
             if response.status_code == 200:
                 result = response.json()
@@ -356,7 +382,7 @@ class AliyunPanClient:
         }
         
         try:
-            response = requests.post(url, json=data, timeout=30)
+            response = self.session.post(url, json=data, timeout=30)
             response.raise_for_status()
             result = response.json()
             
@@ -393,7 +419,7 @@ class AliyunPanClient:
         }
         
         try:
-            response = requests.post(url, json=data, headers=self._get_headers(), timeout=30)
+            response = self.session.post(url, json=data, headers=self._get_headers(), timeout=30)
             if response.status_code == 200:
                 return response.json()
             elif response.status_code == 404:
@@ -406,8 +432,8 @@ class AliyunPanClient:
             logger.debug(f"获取文件信息异常: {file_path}, {str(e)}")
             return None
     
-    def create_folder(self, parent_file_id: str, folder_name: str) -> Optional[str]:
-        """创建文件夹"""
+    def create_folder(self, parent_file_id: str, folder_name: str, retry_count: int = 0, max_retries: int = 3) -> Optional[str]:
+        """创建文件夹（带重试机制）"""
         url = f"{self.base_url}/adrive/v2/file/createWithFolders"
         data = {
             "drive_id": self.drive_id,
@@ -418,7 +444,13 @@ class AliyunPanClient:
         }
         
         try:
-            response = requests.post(url, json=data, headers=self._get_headers(), timeout=30)
+            # 添加延迟，避免请求过快
+            if retry_count > 0:
+                delay = retry_count * 1.0  # 递增延迟
+                logger.info(f"  等待 {delay}s 后重试...")
+                time.sleep(delay)
+            
+            response = self.session.post(url, json=data, headers=self._get_headers(), timeout=30)
             
             # 详细的错误信息
             # 201 Created 也是成功状态
@@ -443,6 +475,15 @@ class AliyunPanClient:
             logger.info(f"文件夹创建成功: {folder_name} (ID: {file_id})")
             return file_id
             
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+            # SSL 错误或连接错误，进行重试
+            if retry_count < max_retries:
+                logger.warning(f"文件夹创建遇到网络错误 '{folder_name}': {str(e)}")
+                logger.info(f"正在重试 ({retry_count + 1}/{max_retries})...")
+                return self.create_folder(parent_file_id, folder_name, retry_count + 1, max_retries)
+            else:
+                logger.error(f"文件夹创建失败 '{folder_name}' (已达最大重试次数): {str(e)}")
+                return None
         except Exception as e:
             logger.error(f"文件夹创建异常 '{folder_name}': {str(e)}")
             return None
@@ -458,7 +499,7 @@ class AliyunPanClient:
                 "type": "folder"
             }
             
-            response = requests.post(url, json=data, headers=self._get_headers(), timeout=30)
+            response = self.session.post(url, json=data, headers=self._get_headers(), timeout=30)
             if response.status_code == 200:
                 result = response.json()
                 items = result.get("items", [])
@@ -537,7 +578,7 @@ class AliyunPanClient:
                 "upload_id": upload_id
             }
             
-            response = requests.post(complete_url, json=complete_data, 
+            response = self.session.post(complete_url, json=complete_data, 
                                     headers=self._get_headers(), timeout=30)
             response.raise_for_status()
             
@@ -548,7 +589,7 @@ class AliyunPanClient:
             return False
     
     def get_or_create_folder_by_path(self, folder_path: str) -> Optional[str]:
-        """根据路径获取或创建文件夹，返回文件夹ID"""
+        """根据路径获取或创建文件夹，返回文件夹ID（带缓存）"""
         logger.debug(f"获取/创建文件夹: {folder_path}")
         
         # 规范化路径
@@ -560,12 +601,20 @@ class AliyunPanClient:
         # 移除开头的斜杠
         folder_path = folder_path.lstrip("/")
         
+        # 检查缓存
+        cache_key = f"/{folder_path}"
+        if cache_key in self.folder_cache:
+            logger.debug(f"从缓存获取文件夹 ID: {self.folder_cache[cache_key]}")
+            return self.folder_cache[cache_key]
+        
         # 检查文件夹是否存在
-        logger.debug(f"检查文件夹是否存在: /{folder_path}")
-        existing = self.get_file_by_path(f"/{folder_path}")
+        logger.debug(f"检查文件夹是否存在: {cache_key}")
+        existing = self.get_file_by_path(cache_key)
         if existing:
             file_id = existing.get("file_id")
             logger.debug(f"文件夹已存在，ID: {file_id}")
+            # 加入缓存
+            self.folder_cache[cache_key] = file_id
             return file_id
         
         # 分割路径，逐层创建
@@ -580,6 +629,12 @@ class AliyunPanClient:
             current_path = f"{current_path}/{part}" if current_path else part
             full_path = f"/{current_path}"
             
+            # 检查缓存
+            if full_path in self.folder_cache:
+                current_parent_id = self.folder_cache[full_path]
+                logger.debug(f"从缓存获取: {part}, ID: {current_parent_id}")
+                continue
+            
             logger.debug(f"处理路径: {full_path}")
             
             # 检查当前层是否存在
@@ -587,14 +642,20 @@ class AliyunPanClient:
             if existing:
                 current_parent_id = existing.get("file_id")
                 logger.debug(f"文件夹已存在: {part}, ID: {current_parent_id}")
+                # 加入缓存
+                self.folder_cache[full_path] = current_parent_id
             else:
                 # 创建当前层
-                logger.debug(f"创建文件夹: {part} (父ID: {current_parent_id})")
+                logger.info(f"  📁 创建文件夹: {part}")
                 folder_id = self.create_folder(current_parent_id, part)
                 if not folder_id:
                     logger.error(f"创建文件夹失败: {part}")
                     return None
                 current_parent_id = folder_id
+                # 加入缓存
+                self.folder_cache[full_path] = folder_id
+                # 添加延迟，避免请求过快
+                time.sleep(0.3)
         
         return current_parent_id
 
@@ -718,7 +779,7 @@ class BaiduToAliyunSync:
                 
                 logger.info(f"  发现: {len(files)} 个文件, {len(folders)} 个子文件夹")
                 
-                # 处理文件
+                # 处理文件：直接提交任务，不预先创建文件夹
                 for file_info in files:
                     file_path = file_info.get("path")
                     file_name = file_info.get("server_filename")
@@ -729,7 +790,7 @@ class BaiduToAliyunSync:
                         logger.info(f"⏭️  跳过已完成: {file_name} (总计跳过: {skip_count})")
                         continue
                     
-                    # 提交同步任务
+                    # 提交同步任务（文件夹会在同步时按需创建）
                     logger.info(f"📤 提交任务: {file_name}")
                     future = executor.submit(
                         self._sync_single_file, 
@@ -739,18 +800,12 @@ class BaiduToAliyunSync:
                     )
                     futures[future] = file_info
                 
-                # 递归处理子文件夹
+                # 递归处理子文件夹（不预先创建）
                 for folder in folders:
                     folder_path = folder.get("path")
                     folder_name = folder.get("server_filename")
                     
-                    # 计算阿里云盘路径
-                    relative_path = folder_path.replace(baidu_folder, "").lstrip("/")
-                    aliyun_path = os.path.join(aliyun_folder, relative_path).replace("\\", "/")
-                    
-                    # 创建文件夹
-                    logger.info(f"📁 创建文件夹: {folder_name}")
-                    self.aliyun_client.get_or_create_folder_by_path(aliyun_path)
+                    logger.debug(f"📂 进入子文件夹: {folder_name}")
                     
                     # 递归处理子目录
                     process_directory(folder_path, aliyun_folder)
@@ -839,7 +894,7 @@ class BaiduToAliyunSync:
                 return False
         
         # 获取阿里云盘父文件夹ID
-        logger.debug(f"  获取父文件夹 ID...")
+        logger.debug(f"  获取/创建父文件夹: {aliyun_dir}")
         parent_folder_id = self.aliyun_client.get_or_create_folder_by_path(aliyun_dir)
         if not parent_folder_id:
             logger.error(f"  ❌ 无法创建父文件夹: {aliyun_dir}")
@@ -848,6 +903,9 @@ class BaiduToAliyunSync:
             except:
                 pass
             return False
+        
+        # 添加小延迟，避免文件夹创建后立即上传导致问题
+        time.sleep(0.2)
         
         # 上传到阿里云盘
         logger.info(f"  ⬆️  上传中...")
